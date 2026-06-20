@@ -1,0 +1,130 @@
+# ── How traffic flows ──────────────────────────────────────────────────────────
+#
+#   Host browser  →  VM port 80  →  nginx  ─┬─ /api/*   → backend:4000
+#                                            └─ /*       → frontend:3000
+#
+#  Only nginx (port 80) and postgres (port 5432) are exposed to the VM host.
+#  The frontend and backend are on the internal Docker network only.
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: vacation_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-vacationuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vacationpass}
+      POSTGRES_DB:       ${POSTGRES_DB:-vacationplanner}
+    ports:
+      - "5432:5432"           # expose only if you need direct psql access from host
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vacationuser} -d ${POSTGRES_DB:-vacationplanner}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  # ── Node / Express API ───────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: vacation_api
+    restart: unless-stopped
+    environment:
+      NODE_ENV:    development
+      PORT:        4000
+      DB_HOST:     postgres
+      DB_PORT:     5432
+      DB_USER:     ${POSTGRES_USER:-vacationuser}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-vacationpass}
+      DB_NAME:     ${POSTGRES_DB:-vacationplanner}
+      JWT_SECRET:  ${JWT_SECRET:-supersecretkey_changeme}
+      # Nginx is the public entry point — accept requests forwarded from it.
+      # Using * here is safe because the backend port is NOT exposed to the host;
+      # only nginx (on the internal network) can reach it.
+      CORS_ORIGIN: "*"
+    # No host port binding — only reachable via nginx on the internal network
+    expose:
+      - "4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+    networks:
+      - internal
+
+  # ── React Frontend ───────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: vacation_ui
+    restart: unless-stopped
+    environment:
+      # Empty string → api.js falls back to a relative /api path, so the
+      # browser calls whatever host it's already on (the VM IP) and nginx
+      # routes /api/* to the backend automatically.
+      REACT_APP_API_URL: ""
+      # Tell CRA's dev-server to accept connections from any host
+      # (needed when accessed via VM IP instead of localhost)
+      DANGEROUSLY_DISABLE_HOST_CHECK: "true"
+      WDS_SOCKET_HOST: "0.0.0.0"
+    # No host port binding — only reachable via nginx on the internal network
+    expose:
+      - "3000"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - internal
+
+  # ── Nginx Reverse Proxy ──────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: vacation_proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"             # <── the ONLY port your host/browser needs
+    # envsubst fills ${BACKEND_HOST} / ${FRONTEND_HOST} in the template at startup.
+    # The official nginx image auto-processes files in /etc/nginx/templates/.
+    environment:
+      BACKEND_HOST:  backend
+      FRONTEND_HOST: frontend
+      BACKEND_PORT:  "4000"
+      FRONTEND_PORT: "3000"
+    volumes:
+      - ./nginx/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    networks:
+      - internal
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  internal:
+    driver: bridge
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:

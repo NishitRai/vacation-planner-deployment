@@ -1,0 +1,85 @@
+# ============================================================
+# Vacation Planner — Nginx Reverse Proxy (Template)
+#
+# This file is a template processed by envsubst at container
+# startup.  Do NOT mount it directly as default.conf — mount
+# it as /etc/nginx/templates/default.conf.template and the
+# official nginx image will run envsubst automatically.
+#
+# Variables injected by docker-compose:
+#   BACKEND_HOST   e.g. "backend"      (dev) | "backend_test"  (test)
+#   FRONTEND_HOST  e.g. "frontend"     (dev) | "frontend_test" (test)
+#   BACKEND_PORT   e.g. "4000"
+#   FRONTEND_PORT  e.g. "3000"
+#
+# Traffic routing:
+#   /api/*   →  ${BACKEND_HOST}:${BACKEND_PORT}
+#   /health  →  ${BACKEND_HOST}:${BACKEND_PORT}
+#   /ws      →  ${FRONTEND_HOST}:${FRONTEND_PORT}  (HMR websocket)
+#   /*       →  ${FRONTEND_HOST}:${FRONTEND_PORT}
+# ============================================================
+
+upstream backend_upstream {
+    server ${BACKEND_HOST}:${BACKEND_PORT};
+    keepalive 32;
+}
+
+upstream frontend_upstream {
+    server ${FRONTEND_HOST}:${FRONTEND_PORT};
+    keepalive 32;
+}
+
+# ── Rate limiting zones ──────────────────────────────────────
+limit_req_zone $binary_remote_addr zone=api:10m rate=60r/m;
+
+server {
+    listen 80;
+    server_name _;
+
+    # ── Compression ─────────────────────────────────────────
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript
+               text/xml application/xml text/javascript;
+    gzip_min_length 1024;
+
+    # ── Timeouts ────────────────────────────────────────────
+    proxy_connect_timeout  10s;
+    proxy_send_timeout     60s;
+    proxy_read_timeout     60s;
+
+    # ── Common proxy headers ─────────────────────────────────
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;
+
+    # ── /api  →  Express backend ─────────────────────────────
+    location /api/ {
+        limit_req zone=api burst=20 nodelay;
+        proxy_pass http://backend_upstream;
+        proxy_set_header Connection "";
+    }
+
+    # ── /health  →  Express backend ──────────────────────────
+    location = /health {
+        proxy_pass http://backend_upstream;
+        proxy_set_header Connection "";
+        access_log off;
+    }
+
+    # ── React HMR WebSocket ──────────────────────────────────
+    location /ws {
+        proxy_pass http://frontend_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+
+    # ── Everything else  →  React frontend ───────────────────
+    location / {
+        proxy_pass http://frontend_upstream;
+        proxy_set_header Connection "";
+        proxy_intercept_errors off;
+    }
+}
